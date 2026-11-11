@@ -11,9 +11,11 @@ import pytest
 from twisted.logger import LogLevel, capturedLogs
 from twisted.web import error
 
+from scrapyd.config import Config
 from scrapyd.exceptions import DirectoryTraversalError, RunnerError
 from scrapyd.interfaces import IEggStorage
 from scrapyd.launcher import ScrapyProcessProtocol
+from scrapyd.spiderqueue import SqliteSpiderQueue
 from scrapyd.webservice import spider_list
 from tests import get_egg_data, get_finished_job, get_message, has_settings, root_add_version, touch
 
@@ -615,6 +617,241 @@ def test_schedule_unique(txrequest, root_with_egg):
     data = json.loads(content)
 
     assert data.pop("jobid") != jobid
+
+
+def schedule_idempotent(root, txrequest, args):
+    txrequest.args = args.copy()
+    txrequest.method = "POST"
+    return json.loads(root.children[b"schedule.json"].render(txrequest))
+
+
+def test_schedule_idempotency_key_replay(txrequest, root_with_egg):
+    queue = root_with_egg.poller.queues["mybot"]
+    args = {
+        b"project": [b"mybot"],
+        b"spider": [b"spider1"],
+        b"idempotency_key": [b"key-1"],
+        b"setting": [b"DOWNLOAD_DELAY=2"],
+        b"arg1": [b"val1"],
+    }
+
+    first = schedule_idempotent(root_with_egg, txrequest, args)
+    jobid = first.pop("jobid")
+    assert first.pop("node_name")
+    assert first == {"status": "ok"}
+    assert re.search(r"^[a-z0-9]{32}$", jobid)
+
+    # Replay the identical request: same jobid, no second queue entry.
+    replay = schedule_idempotent(root_with_egg, txrequest, args)
+    assert replay["jobid"] == jobid
+    assert queue.count() == 1
+    assert queue.list()[0]["_job"] == jobid
+    # The idempotency key is a transport parameter, not a spider argument.
+    assert "idempotency_key" not in queue.list()[0]
+    assert queue.list()[0]["arg1"] == "val1"
+    assert queue.list()[0]["settings"] == {"DOWNLOAD_DELAY": "2"}
+
+    # A replay with the settings and arguments in a different order is not a conflict.
+    reordered = {
+        b"project": [b"mybot"],
+        b"spider": [b"spider1"],
+        b"arg1": [b"val1"],
+        b"idempotency_key": [b"key-1"],
+        b"setting": [b"DOWNLOAD_DELAY=2"],
+    }
+    assert schedule_idempotent(root_with_egg, txrequest, reordered)["jobid"] == jobid
+    assert queue.count() == 1
+
+
+def test_schedule_idempotency_key_distinct_keys(txrequest, root_with_egg):
+    queue = root_with_egg.poller.queues["mybot"]
+
+    first = schedule_idempotent(
+        root_with_egg,
+        txrequest,
+        {b"project": [b"mybot"], b"spider": [b"spider1"], b"idempotency_key": [b"key-1"]},
+    )
+    second = schedule_idempotent(
+        root_with_egg,
+        txrequest,
+        {b"project": [b"mybot"], b"spider": [b"spider1"], b"idempotency_key": [b"key-2"]},
+    )
+
+    assert first["jobid"] != second["jobid"]
+    assert queue.count() == 2
+
+
+def test_schedule_idempotency_key_conflict(txrequest, root_with_egg):
+    queue = root_with_egg.poller.queues["mybot"]
+    base = {b"project": [b"mybot"], b"spider": [b"spider1"], b"idempotency_key": [b"key-1"]}
+
+    first = schedule_idempotent(root_with_egg, txrequest, base)
+    jobid = first["jobid"]
+
+    conflict_args = {**base, b"arg1": [b"val1"]}
+    txrequest.args = conflict_args.copy()
+    txrequest.method = "POST"
+    content = root_with_egg.children[b"schedule.json"].render(txrequest)
+    data = json.loads(content)
+
+    assert txrequest.code == 409
+    assert data.pop("node_name")
+    assert data["status"] == "error"
+    assert data["message"].startswith("idempotency_key 'key-1' was already used with different parameters")
+    assert jobid in data["message"]
+
+    # The conflict did not enqueue a job or change the original job.
+    assert queue.count() == 1
+    assert queue.list()[0]["_job"] == jobid
+
+    # The original key still resolves to the original jobid.
+    assert schedule_idempotent(root_with_egg, txrequest, base)["jobid"] == jobid
+    assert queue.count() == 1
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {b"spider": [b"spider2"]},
+        {b"_version": [b"0.1"], b"setting": [b"A=1"]},
+        {b"priority": [b"5"]},
+        {b"setting": [b"DOWNLOAD_DELAY=3"]},
+        {b"arg1": [b"val1"], b"arg2": [b"val2"]},
+    ],
+)
+def test_schedule_idempotency_key_conflict_parameters(txrequest, root_with_egg, extra):
+    base = {b"project": [b"mybot"], b"spider": [b"spider1"], b"idempotency_key": [b"key-1"]}
+    schedule_idempotent(root_with_egg, txrequest, base)
+
+    conflict_args = {**base, **extra}
+    txrequest.args = conflict_args.copy()
+    txrequest.method = "POST"
+    content = root_with_egg.children[b"schedule.json"].render(txrequest)
+    data = json.loads(content)
+
+    assert txrequest.code == 409
+    assert data["status"] == "error"
+    assert root_with_egg.poller.queues["mybot"].count() == 1
+
+
+def test_schedule_idempotency_key_with_jobid_bad_request(txrequest, root_with_egg):
+    args = {
+        b"project": [b"mybot"],
+        b"spider": [b"spider1"],
+        b"idempotency_key": [b"key-1"],
+        b"jobid": [b"explicit-jobid"],
+    }
+    txrequest.args = args.copy()
+    txrequest.method = "POST"
+
+    with pytest.raises(error.Error) as exc:
+        root_with_egg.children[b"schedule.json"].render_POST(txrequest)
+
+    assert exc.value.status == b"400"
+    assert exc.value.message == b"'idempotency_key' and 'jobid' parameters cannot be used together"
+    assert root_with_egg.poller.queues["mybot"].count() == 0
+
+
+def test_schedule_without_idempotency_key_unchanged(txrequest, root_with_egg):
+    queue = root_with_egg.poller.queues["mybot"]
+    args = {b"project": [b"mybot"], b"spider": [b"spider1"], b"arg1": [b"val1"]}
+
+    first = schedule_idempotent(root_with_egg, txrequest, args)
+    second = schedule_idempotent(root_with_egg, txrequest, args)
+
+    assert first["jobid"] != second["jobid"]
+    assert queue.count() == 2
+    assert len(queue.idempotency_keys) == 0
+
+
+def test_schedule_idempotency_key_restart(txrequest, root_with_egg):
+    queue = root_with_egg.poller.queues["mybot"]
+
+    args = {
+        b"project": [b"mybot"],
+        b"spider": [b"spider1"],
+        b"idempotency_key": [b"key-1"],
+        b"arg1": [b"val1"],
+    }
+    jobid = schedule_idempotent(root_with_egg, txrequest, args)["jobid"]
+    assert queue.count() == 1
+
+    # Simulate a Scrapyd restart by rebuilding the queue over the same database directory.
+    reopened = SqliteSpiderQueue(Config(), "mybot")
+    assert reopened.count() == 1
+    assert reopened.add("spider1", idempotency_key="key-1", _job="ignored", settings={}, arg1="val1") == jobid
+    assert reopened.count() == 1
+
+
+def test_schedule_idempotency_key_survives_lifecycle(txrequest, root_with_egg, scrapy_process):
+    queue = root_with_egg.poller.queues["mybot"]
+    args = {
+        b"project": [b"mybot"],
+        b"spider": [b"spider1"],
+        b"idempotency_key": [b"key-1"],
+        b"arg1": [b"val1"],
+    }
+    jobid = schedule_idempotent(root_with_egg, txrequest, args)["jobid"]
+
+    # While pending, a replay returns the same jobid without enqueuing again.
+    assert schedule_idempotent(root_with_egg, txrequest, args)["jobid"] == jobid
+
+    # The poller pops the job (it starts running).
+    message = queue.pop()
+    assert message["_job"] == jobid
+    assert queue.count() == 0
+
+    # While running, a replay still resolves to the same jobid and does not re-enqueue.
+    root_with_egg.launcher.processes[0] = scrapy_process
+    assert schedule_idempotent(root_with_egg, txrequest, args)["jobid"] == jobid
+    assert queue.count() == 0
+
+    # The job finishes.
+    root_with_egg.launcher.processes.pop(0)
+    root_with_egg.launcher.finished.add(get_finished_job("mybot", "spider1", jobid))
+    assert schedule_idempotent(root_with_egg, txrequest, args)["jobid"] == jobid
+    assert queue.count() == 0
+    assert len(queue.idempotency_keys) == 1
+
+    # Cancelling by jobid does not remove the idempotency key.
+    queue.add("spider1", idempotency_key="key-2", _job="j2", settings={})
+    assert_content(
+        txrequest,
+        root_with_egg,
+        "POST",
+        "cancel",
+        {b"project": [b"mybot"], b"job": [b"j2"]},
+        {"prevstate": "pending"},
+    )
+    assert len(queue.idempotency_keys) == 2
+    # key-2 still resolves to its original jobid.
+    assert schedule_idempotent(
+        root_with_egg,
+        txrequest,
+        {b"project": [b"mybot"], b"spider": [b"spider1"], b"idempotency_key": [b"key-2"]},
+    )["jobid"] == "j2"
+    assert queue.count() == 0
+
+
+def test_schedule_idempotency_key_cleared_on_project_delete(txrequest, root_with_egg):
+    queue = root_with_egg.poller.queues["mybot"]
+    schedule_idempotent(
+        root_with_egg,
+        txrequest,
+        {b"project": [b"mybot"], b"spider": [b"spider1"], b"idempotency_key": [b"key-1"]},
+    )
+    assert len(queue.idempotency_keys) == 1
+
+    assert_content(
+        txrequest,
+        root_with_egg,
+        "POST",
+        "delproject",
+        {b"project": [b"mybot"]},
+        {"status": "ok"},
+    )
+
+    assert len(queue.idempotency_keys) == 0
 
 
 def test_schedule_parameters(txrequest, root_with_egg):

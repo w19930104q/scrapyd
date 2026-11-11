@@ -9,6 +9,7 @@ Unreleased
 Added
 ~~~~~
 
+- Add an optional ``idempotency_key`` parameter to the :ref:`schedule.json` webservice, so that retried schedule requests return the first job's ID instead of starting a second crawl. A reused key with different parameters answers with HTTP ``409 Conflict``; sending the key together with an explicit ``jobid`` answers with HTTP ``400 Bad Request``. The key and the queued job are committed atomically by the default SQLite :ref:`spiderqueue`, which also accepts the key only once when several Scrapyd instances share a database. Old databases are upgraded automatically.
 - Add DEBUG-level messages to the :ref:`schedule.json` and :ref:`cancel.json` webservices.
 
 Changed

@@ -39,6 +39,9 @@ class SqliteMixin:
         self.table = table
         # Regarding check_same_thread, see http://twistedmatrix.com/trac/ticket/4040
         self.conn = sqlite3.connect(self.database, check_same_thread=False)
+        # Wait for a competing writer (for example, another Scrapyd instance sharing this database) to release its
+        # lock, instead of raising sqlite3.OperationalError("database is locked") immediately.
+        self.conn.execute("PRAGMA busy_timeout = 5000")
 
     def __len__(self):
         return self.conn.execute(f"SELECT COUNT(*) FROM {self.table}").fetchone()[0]
@@ -111,6 +114,55 @@ class JsonSqlitePriorityQueue(SqliteMixin):
                 f"SELECT message, priority FROM {self.table} ORDER BY priority DESC"
             )
         )
+
+
+class JsonSqliteIdempotencyKeys(SqliteMixin):
+    """
+    SQLite table mapping idempotency keys to the job ID and normalized parameters of their first schedule request.
+
+    The table lives in the same database file as the project's :class:`JsonSqlitePriorityQueue`, so an idempotent
+    schedule request can enqueue a job and register its key in a single atomic transaction.
+    """
+
+    def __init__(self, database=None, table="idempotency_keys", conn=None):
+        if conn is not None:
+            # Share an existing connection, so that both tables can be updated in one transaction. The database
+            # argument is retained for bookkeeping only.
+            self.database = database or ":memory:"
+            self.table = table
+            self.conn = conn
+        else:
+            super().__init__(database, table)
+
+        # "CREATE TABLE IF NOT EXISTS" makes databases created by older Scrapyd versions compatible without a
+        # separate migration.
+        self.conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {table} "
+            "(key text PRIMARY KEY, job text NOT NULL, fingerprint text NOT NULL)"
+        )
+
+    def get(self, key):
+        row = self.conn.execute(
+            f"SELECT job, fingerprint FROM {self.table} WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"job": row[0], "fingerprint": row[1]}
+
+    def add(self, key, job, fingerprint):
+        # An IntegrityError is raised if another transaction (for example, in another Scrapyd instance sharing the
+        # database) inserted the same key after the current transaction began.
+        self.conn.execute(
+            f"INSERT INTO {self.table} (key, job, fingerprint) VALUES (?, ?, ?)",
+            (key, job, fingerprint),
+        )
+
+    def clear(self):
+        self.conn.execute(f"DELETE FROM {self.table}")
+        self.conn.commit()
+
+    def __len__(self):
+        return self.conn.execute(f"SELECT COUNT(*) FROM {self.table}").fetchone()[0]
 
 
 class SqliteFinishedJobs(SqliteMixin):

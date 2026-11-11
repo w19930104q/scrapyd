@@ -95,8 +95,19 @@ class ISpiderQueue(Interface):
         ``_job`` ID, egg ``_version`` and Scrapy ``settings`` depending on the implementation, with keyword arguments
         that are not recognized by the implementation being treated as spider arguments.
 
+        Return the job's ID (the ``_job`` argument) of the enqueued job.
+
+        Implementations may accept an ``idempotency_key`` keyword argument to make the operation idempotent. When it
+        is provided, the first request enqueues a job and registers the key; a later request with the same key and
+        equivalent parameters returns the first job's ID without enqueuing another job, and a later request with the
+        same key but different parameters raises
+        :exc:`~scrapyd.exceptions.IdempotencyConflictError`. The default
+        :class:`~scrapyd.spiderqueue.SqliteSpiderQueue` performs both writes atomically.
+
         .. versionchanged:: 1.3.0
            Add the ``priority`` parameter.
+        .. versionchanged:: 1.7.0
+           Add the optional ``idempotency_key`` parameter and a return value.
         """
 
     def pop():
@@ -128,6 +139,26 @@ class ISpiderQueue(Interface):
         Remove all pending jobs.
         """
 
+    def add_idempotent(name, priority, idempotency_key, spider_args):
+        """
+        Add a pending job under an ``idempotency_key``, or return the first job's ID if the key was already used.
+
+        If the key was already used with parameters whose fingerprint differs, raise
+        :exc:`~scrapyd.exceptions.IdempotencyConflictError`. The key registration and the queue insertion must be
+        committed atomically, so that a storage failure leaves neither behind.
+
+        This method is optional; it is implemented by the default
+        :class:`~scrapyd.spiderqueue.SqliteSpiderQueue`.
+        """
+
+    def clear_idempotency_keys():
+        """
+        Remove all idempotency keys of the project. Called when the project is deleted.
+
+        This method is optional; it is implemented by the default
+        :class:`~scrapyd.spiderqueue.SqliteSpiderQueue`.
+        """
+
 
 class ISpiderScheduler(Interface):
     """
@@ -136,10 +167,12 @@ class ISpiderScheduler(Interface):
 
     def schedule(project, spider_name, priority, **spider_args):
         """
-        Schedule a crawl.
+        Schedule a crawl and return the job's ID.
 
         .. versionchanged:: 1.3.0
            Add the ``priority`` parameter.
+        .. versionchanged:: 1.7.0
+           Add the optional ``idempotency_key`` keyword argument and a return value.
         """
 
     def list_projects():

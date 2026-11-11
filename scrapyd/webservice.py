@@ -15,9 +15,12 @@ from typing import ClassVar
 from twisted.logger import Logger
 from twisted.web import error, http, resource
 
-from scrapyd.exceptions import EggNotFoundError, ProjectNotFoundError, RunnerError
+from scrapyd.exceptions import EggNotFoundError, IdempotencyConflictError, ProjectNotFoundError, RunnerError
 
 log = Logger()
+
+# Sentinel for an omitted "jobid" parameter, so that an explicit "jobid" can be told apart from a generated one.
+MISSING_JOBID = object()
 
 
 def param(
@@ -187,16 +190,29 @@ class Schedule(WsResource):
        Add ``_version`` and ``jobid`` parameters.
     .. versionchanged:: 1.3.0
        Add ``priority`` parameter.
+    .. versionchanged:: 1.7.0
+       Add optional ``idempotency_key`` parameter.
     """
 
     @param("project")
     @param("spider")
     @param("_version", dest="version", required=False, default=None)
     # See https://github.com/scrapy/scrapyd/pull/215
-    @param("jobid", required=False, default=lambda: uuid.uuid1().hex)
+    @param("jobid", required=False, default=MISSING_JOBID)
     @param("priority", required=False, default=0, type=float)
     @param("setting", required=False, default=list, multiple=True)
-    def render_POST(self, txrequest, project, spider, version, jobid, priority, setting):
+    @param("idempotency_key", required=False, default=None)
+    def render_POST(self, txrequest, project, spider, version, jobid, priority, setting, idempotency_key):  # noqa: PLR0917
+        explicit_jobid = jobid is not MISSING_JOBID
+        if not explicit_jobid:
+            jobid = uuid.uuid1().hex
+
+        if idempotency_key is not None and explicit_jobid:
+            raise error.Error(
+                code=http.BAD_REQUEST,
+                message=b"'idempotency_key' and 'jobid' parameters cannot be used together",
+            )
+
         if project not in self.root.poller.queues:
             raise error.Error(code=http.OK, message=b"project '%b' not found" % project.encode())
 
@@ -207,27 +223,33 @@ class Schedule(WsResource):
         if spider not in spiders:
             raise error.Error(code=http.OK, message=b"spider '%b' not found" % spider.encode())
 
+        # The idempotency key is handled by the queue, not passed as a spider argument.
+        txrequest.args.pop(b"idempotency_key", None)
         args = {key.decode(): values[0].decode() for key, values in txrequest.args.items()}
         if version is not None:
             args["_version"] = version
 
-        self.root.scheduler.schedule(
-            project,
-            spider,
-            priority=priority,
-            settings=dict(s.split("=", 1) for s in setting),
-            _job=jobid,
-            **args,
-        )
+        try:
+            scheduled_jobid = self.root.scheduler.schedule(
+                project,
+                spider,
+                priority=priority,
+                settings=dict(s.split("=", 1) for s in setting),
+                _job=jobid,
+                idempotency_key=idempotency_key,
+                **args,
+            )
+        except IdempotencyConflictError as e:
+            raise error.Error(code=http.CONFLICT, message=str(e).encode()) from e
 
         log.debug(
             "Job scheduled: project={project!r} spider={spider!r} job={job!r}",
             project=project,
             spider=spider,
-            job=jobid,
+            job=scheduled_jobid,
         )
 
-        return {"jobid": jobid}
+        return {"jobid": scheduled_jobid}
 
 
 class Cancel(WsResource):

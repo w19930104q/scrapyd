@@ -151,8 +151,8 @@ The class that stores pending jobs.
 Default
   ``scrapyd.spiderqueue.SqliteSpiderQueue``
 Options
-  -  ``scrapyd.spiderqueue.SqliteSpiderQueue`` stores spider queues in SQLite databases named after each project, in the :ref:`dbs_dir` directory
-  -  Implement your own, using the :py:interface:`~scrapyd.interfaces.ISpiderQueue` interface
+  -  ``scrapyd.spiderqueue.SqliteSpiderQueue`` stores spider queues in SQLite databases named after each project, in the :ref:`dbs_dir` directory. Each database also contains an ``idempotency_keys`` table that backs the ``idempotency_key`` parameter of the :ref:`schedule.json` webservice; the table is created automatically, including on databases created by older Scrapyd versions.
+  -  Implement your own, using the :py:interface:`~scrapyd.interfaces.ISpiderQueue` interface. To support the ``idempotency_key`` parameter, also implement the optional ``add_idempotent`` and ``clear_idempotency_keys`` methods.
 Also used by
   -  :ref:`addversion.json` webservice, to create a queue if the project is new
   -  :ref:`schedule.json` webservice, to add a pending job

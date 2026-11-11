@@ -1,8 +1,9 @@
 import datetime
+import sqlite3
 
 import pytest
 
-from scrapyd.sqlite import JsonSqlitePriorityQueue, SqliteFinishedJobs
+from scrapyd.sqlite import JsonSqliteIdempotencyKeys, JsonSqlitePriorityQueue, SqliteFinishedJobs
 from tests import get_finished_job
 
 
@@ -148,3 +149,66 @@ def test_sqlitefinishedjobs__iter__(sqlitefinishedjobs):
     assert (actual[0][0], actual[0][1]) == ("p3", "s3")
     assert (actual[1][0], actual[1][1]) == ("p2", "s2")
     assert (actual[2][0], actual[2][1]) == ("p1", "s1")
+
+
+@pytest.fixture
+def idempotencykeys():
+    store = JsonSqliteIdempotencyKeys(":memory:")
+    store.add("key1", "job1", "fingerprint1")
+    store.add("key2", "job2", "fingerprint2")
+    return store
+
+
+def test_idempotency_keys_get_absent(idempotencykeys):
+    assert idempotencykeys.get("absent") is None
+
+
+def test_idempotency_keys_get_present(idempotencykeys):
+    assert idempotencykeys.get("key1") == {"job": "job1", "fingerprint": "fingerprint1"}
+
+
+def test_idempotency_keys_duplicate_raises(idempotencykeys):
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+        idempotencykeys.add("key1", "job3", "fingerprint3")
+
+    # The failed insert did not change the existing row.
+    assert idempotencykeys.get("key1") == {"job": "job1", "fingerprint": "fingerprint1"}
+
+
+def test_idempotency_keys_len(idempotencykeys):
+    assert len(idempotencykeys) == 2
+
+
+def test_idempotency_keys_clear(idempotencykeys):
+    idempotencykeys.clear()
+
+    assert len(idempotencykeys) == 0
+    assert idempotencykeys.get("key1") is None
+
+    # The table still works after being cleared.
+    idempotencykeys.add("key1", "job3", "fingerprint3")
+    assert idempotencykeys.get("key1") == {"job": "job3", "fingerprint": "fingerprint3"}
+
+
+def test_idempotency_keys_share_connection(tmp_path):
+    queue = JsonSqlitePriorityQueue(str(tmp_path / "project.db"))
+    queue.put({"name": "spider1"}, priority=0.0)
+
+    store = JsonSqliteIdempotencyKeys(tmp_path / "project.db", conn=queue.conn)
+    store.add("key1", "job1", "fingerprint1")
+
+    # Both tables are reachable through the shared connection and committed together.
+    assert len(queue) == 1
+    assert store.get("key1") == {"job": "job1", "fingerprint": "fingerprint1"}
+
+
+def test_idempotency_keys_creates_table_on_legacy_database(tmp_path):
+    database = tmp_path / "project.db"
+    queue = JsonSqlitePriorityQueue(str(database))
+    queue.conn.close()
+
+    # Reopening an existing database (whose queue table was created by an older Scrapyd) must add the table.
+    store = JsonSqliteIdempotencyKeys(str(database))
+    assert len(store) == 0
+    store.add("key1", "job1", "fingerprint1")
+    assert store.get("key1") == {"job": "job1", "fingerprint": "fingerprint1"}

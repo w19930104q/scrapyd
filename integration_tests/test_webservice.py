@@ -170,3 +170,72 @@ def test_delproject_nonexistent_project():
         {"status": "error", "message": "project 'nonexistent' not found"},
         data={"project": "nonexistent"},
     )
+
+
+def test_schedule_idempotency_key():
+    project = "idempotency_project"
+    req("post", "/addversion.json", data={"project": project, "version": "v1", "egg": EGG})
+
+    base = {"project": project, "spider": "spider1", "idempotency_key": "key-1"}
+
+    # The first request enqueues a job and registers the key.
+    first = req("post", "/schedule.json", data=base).json()
+    jobid = first["jobid"]
+    assert first["status"] == "ok"
+
+    # A replay returns the same jobid and does not enqueue a second job.
+    replay = req("post", "/schedule.json", data=base).json()
+    assert replay["jobid"] == jobid
+
+    pending = req("get", "/listjobs.json", params={"project": project}).json()["pending"]
+    assert len(pending) == 1
+    assert pending[0]["id"] == jobid
+
+    # Re-sending the key together with an explicit jobid is a bad request.
+    bad = req(
+        "post",
+        "/schedule.json",
+        status=400,
+        data={**base, "jobid": "explicit"},
+    )
+    assert bad.json()["status"] == "error"
+    assert len(req("get", "/listjobs.json", params={"project": project}).json()["pending"]) == 1
+
+    # The same key with a different spider argument is a conflict.
+    conflict = req(
+        "post",
+        "/schedule.json",
+        status=409,
+        data={**base, "arg1": "val1"},
+    )
+    data = conflict.json()
+    assert data["status"] == "error"
+    assert data["message"].startswith("idempotency_key 'key-1' was already used with different parameters")
+    assert jobid in data["message"]
+
+    # The original job is untouched and the key still resolves to it.
+    pending = req("get", "/listjobs.json", params={"project": project}).json()["pending"]
+    assert len(pending) == 1
+    assert pending[0]["id"] == jobid
+    assert req("post", "/schedule.json", data=base).json()["jobid"] == jobid
+
+    # A different key enqueues a separate job.
+    second = req("post", "/schedule.json", data={**base, "idempotency_key": "key-2"}).json()
+    assert second["jobid"] != jobid
+    assert len(req("get", "/listjobs.json", params={"project": project}).json()["pending"]) == 2
+
+    req("post", "/delproject.json", data={"project": project})
+
+
+def test_schedule_without_idempotency_key_unchanged():
+    project = "idempotency_legacy_project"
+    req("post", "/addversion.json", data={"project": project, "version": "v1", "egg": EGG})
+
+    payload = {"project": project, "spider": "spider1"}
+    first = req("post", "/schedule.json", data=payload).json()
+    second = req("post", "/schedule.json", data=payload).json()
+
+    assert first["jobid"] != second["jobid"]
+    assert len(req("get", "/listjobs.json", params={"project": project}).json()["pending"]) == 2
+
+    req("post", "/delproject.json", data={"project": project})

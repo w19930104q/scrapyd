@@ -37,3 +37,7 @@ class LauncherError(ScrapydError):
 
 class RunnerError(ScrapydError):
     """Raised if the runner returns an error code"""
+
+
+class IdempotencyConflictError(ScrapydError):
+    """Raised if an idempotency key is reused with different job parameters"""

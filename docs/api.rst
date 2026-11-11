@@ -98,6 +98,34 @@ Parameters
     .. code-block:: shell
 
        curl http://localhost:6800/schedule.json -d setting=DOWNLOAD_DELAY=2 -d project=myproject -d spider=somespider
+  ``idempotency_key``
+    an optional key that makes the request idempotent, so that retrying a request (for example, after an upstream
+    timeout) does not start a second crawl
+
+    When the key is used for the first time, the job is enqueued as usual, and the key is stored together with the
+    job's parameters. Every later request that carries the same key (and the same project) is answered with the
+    first request's ``jobid`` without enqueuing another job, whether the first job is still pending, running, has
+    finished or was canceled.
+
+    The parameters of every request carrying a key must be equivalent to those of the first request. The compared
+    parameters are the spider, the ``_version``, the ``priority``, all ``setting`` values and all spider arguments.
+    Equivalent means:
+
+    -  the order of ``setting`` and spider arguments does not matter
+    -  an omitted parameter and its default value (for example, an omitted ``priority`` and ``priority=0``) are
+       equivalent
+
+    If the parameters differ, Scrapyd answers with HTTP status code ``409 Conflict`` and leaves the original job
+    untouched. If ``idempotency_key`` is sent together with an explicit ``jobid``, Scrapyd answers with HTTP status
+    code ``400 Bad Request``. When ``idempotency_key`` is omitted, the request behaves exactly as before and every
+    request enqueues a new job.
+
+    The key is scoped to the project and kept for the whole life of the project: it is not removed when the job
+    leaves the queue, finishes or is cleaned up by :ref:`finished_to_keep`. It is removed only when the project
+    itself is deleted via :ref:`delproject.json`. With the default SQLite :ref:`spiderqueue`, the key and the queued
+    job are committed in a single transaction, so two Scrapyd instances sharing the same database accept the key
+    only once, even under concurrent requests. Databases created by older Scrapyd versions are upgraded
+    automatically.
   Any other parameter
     a spider argument
 
@@ -119,6 +147,20 @@ Example:
 
    $ curl http://localhost:6800/schedule.json -d project=myproject -d spider=somespider
    {"node_name": "mynodename", "status": "ok", "jobid": "6487ec79947edab326d6db28a2d86511e8247444"}
+
+Idempotent scheduling example:
+
+.. code-block:: shell-session
+
+   $ # The first request enqueues a job and registers the key.
+   $ curl http://localhost:6800/schedule.json -d project=myproject -d spider=somespider -d idempotency_key=order-123
+   {"node_name": "mynodename", "status": "ok", "jobid": "6487ec79947edab326d6db28a2d86511e8247444"}
+   $ # A retried request with the same key and equivalent parameters returns the same jobid, without a new crawl.
+   $ curl http://localhost:6800/schedule.json -d project=myproject -d spider=somespider -d idempotency_key=order-123
+   {"node_name": "mynodename", "status": "ok", "jobid": "6487ec79947edab326d6db28a2d86511e8247444"}
+   $ # A request with the same key but different parameters is rejected.
+   $ curl http://localhost:6800/schedule.json -d project=myproject -d spider=somespider -d idempotency_key=order-123 -d arg1=val1
+   {"node_name": "mynodename", "status": "error", "message": "idempotency_key 'order-123' was already used with different parameters (existing job: 6487ec79947edab326d6db28a2d86511e8247444)"}
 
 .. _status.json:
 
